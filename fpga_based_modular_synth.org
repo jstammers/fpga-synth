@@ -1,0 +1,142 @@
+#+TITLE: FPGA-based Modular Synth
+#+AUTHOR: Jimmy Stammers
+#+EMAIL: jimmy.stammers@gmail.com
+#+PROPERTY: header-args: jupyter-python :session py
+* Overview
+* Synth Design
+
+* Oscillator Module
+#+BEGIN_SRC jupyter-python :noweb yes :tangle fpga_synth/oscillator_test.py
+"""
+oscillator.py: A module to define an oscillator using myHDL
+"""
+# imports
+import sys
+<<oscillator-imports>>
+
+# constants
+<<oscillator-constants>>
+# interface functions
+
+# classes
+<<oscillator-defn>>
+
+# internal functions & classes
+<<oscillator-internal>>
+if __name__ == '__main__':
+    <<oscillator-main>>
+#+END_SRC
+
+#+RESULTS:
+
+#+NAME: oscillator-imports
+#+BEGIN_SRC jupyter-python :session py :kernel synth
+from myHDL import Block, enum, intbv, Signal, ResetSignal
+import math
+#+END_SRC
+
+#+RESULTS: oscillator-imports
+:RESULTS:
+# [goto error]
+:
+: ModuleNotFoundErrorTraceback (most recent call last)
+: <ipython-input-1-3f9d51938761> in <module>
+: ----> 1 from myHDL import Block, enum, intbv, Signal, ResetSignal
+:       2 import math
+:
+: ModuleNotFoundError: No module named 'myHDL'
+:END:
+First, let's enumerate the different waveforms that the oscillator can output. For each waveform, we must also define the number of samples `n_samps` that are used to store a single period of the waveform. The `bit_depth` constant is used to define the resolution of the amplitude. Since the output will be measured using a 12-bit ADC, this is set to 12. However, the final synthesiser will have a DAC that has a 16-bit dynamic range.
+
+Each of the waveforms is represented digitally using a vector of `n_samp` integers. Setting the minimum to 0 and the maximum to $2^{bit_depth}$ ensures that only `bit_depth` bits are required to sepcify each value. This is useful in that it ensures that each value will be correctly interpreted by the DAC and reduces the amount of memory required to store these waveforms.
+#+NAME: oscillator-constants
+#+BEGIN_SRC jupyter-python :session py
+osc_state = enum('SINE','SQUARE','TRIANGLE', 'SAWTOOTH', 'PWM', 'NOISE')
+n_samps = 4096
+bit_depth = 12
+
+amp = 2**bit_depth - 1
+
+sine = [intbv(int(amp * 0.5*(math.sin(2 * math.pi * x/n_samps)+1)),
+              min=0, max=amp+1) for x in range(n_samps)]
+square = [intbv(amp, min=0, max=amp+1) for _ in range(int(n_samps/2))] + [intbv(0, min=0, max=amp+1) for _ in range(int(n_samps/2))]
+
+triangle = [intbv(n_samps//2 + int(2*amp/(n_samps) * math.fabs(x % (n_samps) - (n_samps)/2) - 2*amp/4), min=0, max=amp+1) for x in range(n_samps //4, 5 * n_samps //4)]
+
+sawtooth = [intbv(int(amp * (x/n_samps - math.floor(0.5 + x/n_samps)) + amp//2), min=0, max=amp+1) for x in range(n_samps)]
+#+END_SRC
+
+#+RESULTS: oscillator-constants
+: Traceback (most recent call last):
+:   File "<stdin>", line 11, in <module>
+:   File "<string>", line 1, in <module>
+: NameError: name 'enum' is not defined
+The oscillator itself is defined using the `block` decorator. This is configured to output a sample on each positive clock edge. The value of the `inc` signal sets the frequency of the output by specificying the number of samples that are incremented each clock cycle. The relationship between the output frequency $f_o$ and the DDS clock frequency $f_c$ is given by
+$$
+f_o = \frac{m f_{c}}{2^n}
+$$
+where $n$ is the number of bits used to represent each sample. In this case, since there are 4096 samples, $n = 12$. The address of the output sample is obtained by incrementing the current count value. Since the output frequency is typically much smaller than the clock frequency
+#+NAME: oscillator-defn
+#+BEGIN_SRC python
+@block
+def Oscillator(z, state, clock: Signal, output_freq: int, reset, sampling_freq:int):
+
+    count = Signal(modbv(0, min=0, max=2**24))
+    inc = Signal(intbv(0, min=0, max=2**24))
+
+    @always_seq(clock.posedge, reset=reset)
+    def output():
+        count.next = count + inc
+        addr = count[24:12]
+        if state == osc_state.SINE:
+            z.next = sine[addr]
+        elif state == osc_state.SQUARE:
+            z.next = square[addr]
+        elif state == osc_state.TRIANGLE:
+            z.next = triangle[addr]
+        elif state == osc_state.SAWTOOTH:
+            z.next = sawtooth[addr]
+        elif state == osc_state.PWM:
+            pass
+        elif state == osc_state.NOISE:
+            pass
+
+    @always_comb
+    def increment():
+        inc_val = intbv(int(n_samps * output_freq * 2**12 / sampling_freq), min=0, max=2**24)
+        inc.val = inc_val
+
+    return output
+#+END_SRC
+
+#+RESULTS: oscillator-defn
+
+#+NAME: oscillator-internal
+#+BEGIN_SRC python
+
+@block
+def top():
+    sampling_freq = 48000000
+    clock = Signal(bool(0))
+    reset = ResetSignal(bool(0), active=False, isasync=True)
+    dout = Signal(0)
+    state = Signal(osc_state.SINE)
+    output_freq = Signal(440)
+
+    @always(delay(10))
+    def drive_clk():
+        clock.next = not clock
+
+    channel = Oscillator(dout, state, clock, output_freq, reset, sampling_freq)
+
+    return channel
+#+END_SRC
+
+#+RESULTS: oscillator-internal
+
+#+NAME: oscillator-main
+#+BEGIN_SRC python
+inst = top()
+inst.convert()
+#+END_SRC
+* ASDR
